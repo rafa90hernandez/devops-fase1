@@ -1,0 +1,5 @@
+# Copie para terraform.tfvars e ajuste os valores
+
+aws_region  = "us-east-1"
+bucket_name = "devops-fase1-SEU-USUARIO-UNICO"
+create_ec2  = false
