@@ -1,8 +1,8 @@
 # Fase 1 – Configuração e Automação Inicial (DevOps na Prática)
 
-**Estudante:** (preencher)  
+**Estudante:** Rafael Hernandez
 **Disciplina:** DevOps na Prática  
-**Data:** (preencher)
+**Data:** 25/08/2025
 
 ---
 
@@ -24,7 +24,7 @@ Criar uma API simples (Node.js + Express) com testes automatizados e um pipeline
 - **Qualidade:** ESLint (airbnb-base simplificado).
 - **CI:** GitHub Actions.
 - **IaC:** Terraform ≥ 1.5.
-- **Cloud:** AWS (qualquer região suportada, ex.: `us-east-1`).  
+- **Cloud:** AWS.  
 - **Conta GitHub + Conta AWS** e **segredos** no repositório (quando executar `plan/apply`).
 
 ---
@@ -44,7 +44,7 @@ Criar uma API simples (Node.js + Express) com testes automatizados e um pipeline
    - `checkout` → `setup-node` (cache npm) → `npm ci`
    - `npm run lint`
    - `npm test -- --coverage`
-   - Publicar artefato (ex.: `coverage/` e pacote buildado se houver)
+   - Publicar artefato 
 2. **Infra (Terraform – validação)**
    - `terraform fmt -check`
    - `terraform init`
@@ -52,7 +52,7 @@ Criar uma API simples (Node.js + Express) com testes automatizados e um pipeline
    - (Opcional) `terraform plan` quando os segredos AWS estiverem configurados
 
 ### Segredos (para IaC opcional)
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (ex.: `us-east-1`).
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`.
 
 ---
 
@@ -77,9 +77,7 @@ Criar uma API simples (Node.js + Express) com testes automatizados e um pipeline
 ---
 
 ## 4) Link do Repositório
-> Suba todo o conteúdo desta pasta para um repositório (ex.: `https://github.com/<seu-usuario>/devops-fase1`).  
-> **Link do repositório:** (inserir aqui)
-
+> **Link do repositório:** [https://github.com/rafa90hernandez/devops-fase1]
 ---
 
 ## 5) Testes Automatizados
@@ -122,8 +120,6 @@ cd infra/terraform
 terraform fmt -check
 terraform init
 terraform validate
-# Opcional (se tiver segredos configurados no ambiente):
-# terraform plan -var="aws_region=us-east-1" -var="bucket_name=devops-fase1-<seu-usuario>"
 ```
 
 ---

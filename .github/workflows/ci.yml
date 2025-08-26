@@ -23,7 +23,7 @@ jobs:
 
       - name: Install deps
         working-directory: app
-        run: npm ci
+        run: npm ci || npm install
 
       - name: Lint
         working-directory: app
@@ -60,10 +60,13 @@ jobs:
       - name: Terraform validate
         run: terraform validate
 
-      # Descomente para habilitar o plan (requer segredos da AWS)
-      # - name: Terraform plan
-      #   env:
-      #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      #     AWS_REGION: ${{ secrets.AWS_REGION }}
-      #   run: terraform plan -var="aws_region=${{ env.AWS_REGION }}" -var="bucket_name=${{ github.repository }}-artifacts"
+      - name: Terraform plan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}   
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          terraform plan \
+            -var="aws_region=${AWS_REGION}" \
+            -var="bucket_name=devops-fase1-rafael-2025-artifacts"
