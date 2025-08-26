@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<coverage generated="1756165295034" clover="3.2.0">
-  <project timestamp="1756165295034" name="All files">
+<coverage generated="1756170429563" clover="3.2.0">
+  <project timestamp="1756170429563" name="All files">
     <metrics statements="9" coveredstatements="5" conditionals="2" coveredconditionals="0" methods="2" coveredmethods="1" elements="13" coveredelements="6" complexity="0" loc="9" ncloc="9" packages="1" files="2" classes="2"/>
     <file name="app.js" path="C:\Users\rafae\OneDrive\Documentos\Estudos\devops-fase1\app\src\app.js">
       <metrics statements="5" coveredstatements="5" conditionals="0" coveredconditionals="0" methods="1" coveredmethods="1"/>
