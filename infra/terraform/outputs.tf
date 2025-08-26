@@ -5,5 +5,5 @@ output "s3_bucket_name" {
 
 output "ec2_public_ip" {
   description = "IP público da instância EC2 (se criada)"
-  value       = try(aws_instance.api[0].public_ip, null)
+  value       = length(aws_instance.api) > 0 ? aws_instance.api[0].public_ip : null
 }
