@@ -81,7 +81,7 @@ Criar uma API simples (Node.js + Express) com testes automatizados e um pipeline
 ## 4) Link do Repositório
 **Link do repositório:** [github.com/rafa90hernandez/devops-fase1](https://github.com/rafa90hernandez/devops-fase1)
 
-> *OBS.: Este documento referencia o repositório que contém o pipeline de CI e os scripts IaC.*
+> *OBS: Este documento referencia o repositório que contém o pipeline de CI e os scripts IaC.*
 
 ---
 
