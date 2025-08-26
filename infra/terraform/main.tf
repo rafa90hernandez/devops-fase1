@@ -1,7 +1,7 @@
 # S3 Bucket (sempre)
 resource "aws_s3_bucket" "artifacts" {
   bucket = var.bucket_name
-  tags = { Project = "devops-fase1" }
+  tags   = { Project = "devops-fase1" }
 }
 
 # ====== SOMENTE QUANDO create_ec2 = true ======
