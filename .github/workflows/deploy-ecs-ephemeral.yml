@@ -1,4 +1,5 @@
 name: Deploy Demo (Ephemeral ECS Fargate)
+
 on:
   workflow_dispatch:
 
@@ -9,13 +10,14 @@ permissions:
 jobs:
   run-ephemeral:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
-      ECR_REPO:   ${{ secrets.ECR_REPO }}
+      ECR_REPO:   ${{ secrets.ECR_REPO }}          # ex.: 6900....dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app
       CLUSTER:    devops-fase1-ephemeral
       FAMILY:     devops-fase1-task
       EXEC_ROLE:  ecsTaskExecutionRole-devops-fase1
-      LOG_GROUP:  /ecs/devops-fase1
+      LOG_GROUP:  /ecs/devops-fase1-ephemeral
       PORT:       "3000"
 
     steps:
@@ -36,28 +38,52 @@ jobs:
           ACC=$(aws sts get-caller-identity --query Account --output text)
           VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
           SUBS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC --query 'Subnets[].SubnetId' --output text)
-          echo "account=$ACC" >> $GITHUB_OUTPUT
-          echo "vpc=$VPC"     >> $GITHUB_OUTPUT
+          echo "account=$ACC"  >> $GITHUB_OUTPUT
+          echo "vpc=$VPC"      >> $GITHUB_OUTPUT
           echo "subnets=$SUBS" >> $GITHUB_OUTPUT
+          # deixe também em variáveis de ambiente para uso simples
+          echo "ACCOUNT_ID=$ACC" >> $GITHUB_ENV
+
+      - name: Ensure ECS service-linked role exists (AWSServiceRoleForECS)
+        run: |
+          set -e
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com || true
+          aws iam get-role --role-name AWSServiceRoleForECS >/dev/null
 
       - name: Ensure execution role for ECS tasks
         run: |
           set -e
           cat > trust.json <<'JSON'
-          {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+          {
+            "Version":"2012-10-17",
+            "Statement":[
+              {
+                "Effect":"Allow",
+                "Principal":{"Service":"ecs-tasks.amazonaws.com"},
+                "Action":"sts:AssumeRole"
+              }
+            ]
+          }
           JSON
+
           aws iam get-role --role-name "$EXEC_ROLE" >/dev/null 2>&1 || \
             aws iam create-role --role-name "$EXEC_ROLE" --assume-role-policy-document file://trust.json
-          aws iam attach-role-policy --role-name "$EXEC_ROLE" --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
-          aws iam attach-role-policy --role-name "$EXEC_ROLE" --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly || true
+
+          aws iam attach-role-policy --role-name "$EXEC_ROLE" \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+
+          aws iam attach-role-policy --role-name "$EXEC_ROLE" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly || true
 
       - name: Ensure cluster and security group
         id: net
         run: |
           set -e
+          # cluster
           aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null | grep -q ACTIVE || \
             aws ecs create-cluster --cluster-name "$CLUSTER" >/dev/null
 
+          # SG na VPC default
           VPC="${{ steps.disco.outputs.vpc }}"
           SG_NAME=devops-fase1-ephemeral-sg
           SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "ephemeral ecs" --vpc-id "$VPC" --query 'GroupId' --output text 2>/dev/null || true)
@@ -67,12 +93,12 @@ jobs:
           aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port $PORT --cidr 0.0.0.0/0 2>/dev/null || true
           echo "sg=$SG_ID" >> $GITHUB_OUTPUT
 
-      - name: Register task definition
+      - name: Register task definition (uses ecsTaskExecutionRole-devops-fase1)
         id: td
         run: |
           set -e
           aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
-          ACC="${{ steps.disco.outputs.account }}"
+
           cat > td.json <<JSON
           {
             "family": "${FAMILY}",
@@ -80,25 +106,34 @@ jobs:
             "requiresCompatibilities": ["FARGATE"],
             "cpu": "256",
             "memory": "512",
-            "executionRoleArn": "arn:aws:iam::${ACC}:role/${EXEC_ROLE}",
-            "containerDefinitions": [{
-              "name": "app",
-              "image": "${ECR_REPO}:latest",
-              "portMappings": [{"containerPort": ${PORT}, "protocol": "tcp"}],
-              "essential": true,
-              "environment": [{"name":"NODE_ENV","value":"production"}],
-              "logConfiguration": {
-                "logDriver": "awslogs",
-                "options": {
-                  "awslogs-group": "${LOG_GROUP}",
-                  "awslogs-region": "${AWS_REGION}",
-                  "awslogs-stream-prefix": "app"
+            "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/${EXEC_ROLE}",
+            "containerDefinitions": [
+              {
+                "name": "app",
+                "image": "${ECR_REPO}:latest",
+                "portMappings": [
+                  { "containerPort": ${PORT}, "protocol": "tcp" }
+                ],
+                "essential": true,
+                "environment": [
+                  { "name": "NODE_ENV", "value": "production" }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "${LOG_GROUP}",
+                    "awslogs-region": "${AWS_REGION}",
+                    "awslogs-stream-prefix": "app"
+                  }
                 }
               }
-            }]
+            ]
           }
           JSON
-          REV=$(aws ecs register-task-definition --cli-input-json file://td.json --query 'taskDefinition.revision' --output text)
+
+          REV=$(aws ecs register-task-definition \
+            --cli-input-json file://td.json \
+            --query 'taskDefinition.revision' --output text)
           echo "rev=$REV" >> $GITHUB_OUTPUT
 
       - name: Run task (public IP) and wait for IP
@@ -106,13 +141,14 @@ jobs:
         run: |
           set -e
           SUBS="${{ steps.disco.outputs.subnets }}"
-          SUBS_JSON=$(echo $SUBS | sed 's/ \+/,/g')
+          SUBS_JSON=$(echo $SUBS | sed 's/ \+/,/g')   # vira subnet-1,subnet-2
           SG="${{ steps.net.outputs.sg }}"
           TD_REV="${{ steps.td.outputs.rev }}"
 
           TASK_ARN=$(aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --count 1 \
             --network-configuration "awsvpcConfiguration={subnets=[$SUBS_JSON],securityGroups=[$SG],assignPublicIp=ENABLED}" \
-            --task-definition "${FAMILY}:${TD_REV}" --query 'tasks[0].taskArn' --output text)
+            --task-definition "${FAMILY}:${TD_REV}" \
+            --query 'tasks[0].taskArn' --output text)
           echo "task=$TASK_ARN" >> $GITHUB_OUTPUT
 
           for i in {1..30}; do
@@ -135,7 +171,7 @@ jobs:
           set -e
           IP="${{ steps.run.outputs.ip }}"
           for i in {1..30}; do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "http://$IP:${PORT}/health" || true)
+            code=$(curl -m 3 -s -o /dev/null -w "%{http_code}" "http://$IP:${PORT}/health" || true)
             echo "try $i -> $code"
             test "$code" = "200" && exit 0
             sleep 5
@@ -151,3 +187,11 @@ jobs:
           aws ecs stop-task --cluster "$CLUSTER" --task "$TASK" >/dev/null 2>&1 || true
           sleep 20
           aws ec2 delete-security-group --group-id "$SG" >/dev/null 2>&1 || true
+
+      # (Opcional) Desregistrar a revisão criada para não acumular muitas
+      - name: Deregister task definition revision (optional)
+        if: always()
+        run: |
+          set +e
+          REV="${{ steps.td.outputs.rev }}"
+          aws ecs deregister-task-definition --task-definition "${FAMILY}:${REV}" >/dev/null 2>&1 || true
