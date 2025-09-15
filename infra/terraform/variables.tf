@@ -40,7 +40,7 @@ variable "apprunner_cpu" {
   type        = string
   default     = "1024"
   validation {
-    condition     = contains(["1024","2048"], var.apprunner_cpu)
+    condition     = contains(["1024", "2048"], var.apprunner_cpu)
     error_message = "apprunner_cpu deve ser 1024 ou 2048."
   }
 }
@@ -50,7 +50,7 @@ variable "apprunner_memory" {
   type        = string
   default     = "2048"
   validation {
-    condition     = contains(["2048","3072","4096"], var.apprunner_memory)
+    condition     = contains(["2048", "3072", "4096"], var.apprunner_memory)
     error_message = "apprunner_memory deve ser 2048, 3072 ou 4096."
   }
 }
