@@ -1,0 +1,233 @@
+name: CD – Build, Push & Ephemeral Deploy (ECS Fargate)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}           # us-east-2
+  ECR_REPO:   ${{ secrets.ECR_REPO }}             # ex.: 6900....dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app
+  PORT:       "3000"
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_sha: ${{ steps.meta.outputs.image_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node (para rodar lint/test antes de buildar)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install deps
+        working-directory: app
+        run: npm ci || npm install
+
+      - name: Lint
+        working-directory: app
+        run: npm run lint
+
+      - name: Tests
+        working-directory: app
+        run: npm test -- --coverage
+
+      - name: Configure AWS credentials (ECR login)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$(echo $ECR_REPO | awk -F/ '{print $1}')"
+
+      - name: Compute tags
+        id: meta
+        run: |
+          echo "image_sha=$ECR_REPO:${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          echo "IMAGE_SHA=$ECR_REPO:${GITHUB_SHA}"  >> $GITHUB_ENV
+          echo "IMAGE_LATEST=$ECR_REPO:latest"      >> $GITHUB_ENV
+
+      - name: Build image
+        working-directory: app
+        run: |
+          docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
+
+      - name: Push image
+        run: |
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+
+  deploy-ephemeral:
+    needs: build-push
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER:    devops-fase1-ephemeral
+      FAMILY:     devops-fase1-task
+      EXEC_ROLE:  ecsTaskExecutionRole-devops-fase1
+      LOG_GROUP:  /ecs/devops-fase1-ephemeral
+      IMAGE_URI:  ${{ needs.build-push.outputs.image_sha }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Discover account/VPC/subnets
+        id: disco
+        shell: bash
+        run: |
+          set -e
+          export AWS_PAGER=""
+          ACC=$(aws sts get-caller-identity --query Account --output text)
+          VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+          SUBS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC --query 'Subnets[].SubnetId' --output text)
+          echo "ACCOUNT_ID=$ACC"   >> $GITHUB_ENV
+          echo "vpc=$VPC"          >> $GITHUB_OUTPUT
+          echo "subnets=$SUBS"     >> $GITHUB_OUTPUT
+
+      - name: Ensure ECS service-linked role exists
+        run: |
+          set -e
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com || true
+          aws iam get-role --role-name AWSServiceRoleForECS >/dev/null
+
+      - name: Ensure execution role for ECS tasks
+        run: |
+          set -e
+          cat > trust.json <<'JSON'
+          { "Version":"2012-10-17",
+            "Statement":[{ "Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole" }]
+          }
+          JSON
+          aws iam get-role --role-name "$EXEC_ROLE" >/dev/null 2>&1 || \
+            aws iam create-role --role-name "$EXEC_ROLE" --assume-role-policy-document file://trust.json
+          aws iam attach-role-policy --role-name "$EXEC_ROLE" \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+          aws iam attach-role-policy --role-name "$EXEC_ROLE" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly || true
+
+      - name: Ensure cluster and SG
+        id: net
+        run: |
+          set -e
+          aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null | grep -q ACTIVE \
+            || aws ecs create-cluster --cluster-name "$CLUSTER" >/dev/null
+
+          VPC="${{ steps.disco.outputs.vpc }}"
+          SG_NAME=devops-fase1-ephemeral-sg
+          SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "ephemeral ecs" --vpc-id "$VPC" --query 'GroupId' --output text 2>/dev/null || true)
+          if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+            SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$SG_NAME" Name=vpc-id,Values="$VPC" --query 'SecurityGroups[0].GroupId' --output text)
+          fi
+          aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port $PORT --cidr 0.0.0.0/0 2>/dev/null || true
+          echo "sg=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Set log retention (1 day)
+        run: |
+          aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
+          aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 1 || true
+
+      - name: Register task definition (uses ecsTaskExecutionRole-devops-fase1)
+        id: td
+        run: |
+          set -e
+          cat > td.json <<JSON
+          {
+            "family": "${FAMILY}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/${EXEC_ROLE}",
+            "containerDefinitions": [{
+              "name": "app",
+              "image": "${IMAGE_URI}",
+              "portMappings": [{ "containerPort": ${PORT}, "protocol": "tcp" }],
+              "essential": true,
+              "environment": [{ "name":"NODE_ENV","value":"production" }],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "${LOG_GROUP}",
+                  "awslogs-region": "${AWS_REGION}",
+                  "awslogs-stream-prefix": "app"
+                }
+              }
+            }]
+          }
+          JSON
+          REV=$(aws ecs register-task-definition --cli-input-json file://td.json --query 'taskDefinition.revision' --output text)
+          echo "rev=$REV" >> $GITHUB_OUTPUT
+
+      - name: Run task (public IP) and wait
+        id: run
+        run: |
+          set -e
+          SUBS="${{ steps.disco.outputs.subnets }}"
+          SUBS_JSON=$(echo $SUBS | sed 's/ \+/,/g')
+          SG="${{ steps.net.outputs.sg }}"
+          TD_REV="${{ steps.td.outputs.rev }}"
+
+          TASK_ARN=$(aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --count 1 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBS_JSON],securityGroups=[$SG],assignPublicIp=ENABLED}" \
+            --task-definition "${FAMILY}:${TD_REV}" --query 'tasks[0].taskArn' --output text)
+          echo "task=$TASK_ARN" >> $GITHUB_OUTPUT
+
+          for i in {1..30}; do
+            ENI=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+              --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
+            if [ -n "$ENI" ] && [ "$ENI" != "None" ]; then
+              PUBIP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" \
+                --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+              if [ -n "$PUBIP" ] && [ "$PUBIP" != "None" ]; then
+                echo "ip=$PUBIP" >> $GITHUB_OUTPUT
+                echo "Public IP: $PUBIP"
+                break
+              fi
+            fi
+            sleep 5
+          done
+
+      - name: Smoke test /health
+        run: |
+          set -e
+          IP="${{ steps.run.outputs.ip }}"
+          for i in {1..30}; do
+            code=$(curl -m 3 -s -o /dev/null -w "%{http_code}" "http://$IP:${PORT}/health" || true)
+            echo "try $i -> $code"
+            test "$code" = "200" && exit 0
+            sleep 5
+          done
+          echo "Smoke test falhou"; exit 1
+
+      - name: Stop task and clean SG
+        if: always()
+        run: |
+          set +e
+          TASK="${{ steps.run.outputs.task }}"
+          SG="${{ steps.net.outputs.sg }}"
+          aws ecs stop-task --cluster "$CLUSTER" --task "$TASK" >/dev/null 2>&1 || true
+          sleep 20
+          aws ec2 delete-security-group --group-id "$SG" >/dev/null 2>&1 || true
+
+      - name: Deregister task definition (optional)
+        if: always()
+        run: |
+          set +e
+          REV="${{ steps.td.outputs.rev }}"
+          aws ecs deregister-task-definition --task-definition "${FAMILY}:${REV}" >/dev/null 2>&1 || true
