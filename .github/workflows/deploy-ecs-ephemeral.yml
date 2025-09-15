@@ -1,6 +1,3 @@
-mkdir -p .github/workflows
-
-cat > .github/workflows/deploy-ecs-ephemeral.yml << 'YAML'
 name: Deploy Demo (Ephemeral ECS Fargate)
 on:
   workflow_dispatch:
