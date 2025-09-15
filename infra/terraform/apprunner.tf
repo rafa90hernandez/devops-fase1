@@ -3,9 +3,9 @@ resource "aws_iam_role" "apprunner_ecr_access" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
+      Effect    = "Allow",
       Principal = { Service = "build.apprunner.amazonaws.com" },
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -17,7 +17,7 @@ resource "aws_iam_role_policy" "apprunner_ecr_policy" {
     Version = "2012-10-17",
     Statement = [{
       Effect   = "Allow",
-      Action   = ["ecr:GetAuthorizationToken","ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],
+      Action   = ["ecr:GetAuthorizationToken", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
       Resource = "*"
     }]
   })
@@ -32,7 +32,7 @@ resource "aws_apprunner_service" "api" {
       image_identifier      = "${aws_ecr_repository.app.repository_url}:latest"
       image_repository_type = "ECR"
       image_configuration {
-        port = "3000"
+        port                          = "3000"
         runtime_environment_variables = { NODE_ENV = "production" }
       }
     }
