@@ -151,4 +151,3 @@ jobs:
           aws ecs stop-task --cluster "$CLUSTER" --task "$TASK" >/dev/null 2>&1 || true
           sleep 20
           aws ec2 delete-security-group --group-id "$SG" >/dev/null 2>&1 || true
-YAML
