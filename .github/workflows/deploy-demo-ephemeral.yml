@@ -53,6 +53,13 @@ jobs:
           terraform import 'aws_iam_role_policy.apprunner_ecr_policy[0]' 'apprunner-ecr-access-role:apprunner-ecr-policy' || true
           exit 0
 
+- name: Ensure App Runner service-linked role exists
+  run: |
+    set -e
+    aws iam create-service-linked-role --aws-service-name apprunner.amazonaws.com || true
+    aws iam get-role --role-name AWSServiceRoleForAppRunner
+
+
       - name: APPLY (CRIAR App Runner somente para demo)
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
