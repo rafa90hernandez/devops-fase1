@@ -1,4 +1,4 @@
-name: CD Ephemeral (ECS Fargate)
+name: CD – Build, Push & Ephemeral Deploy (ECS Fargate)
 
 on:
   push:
@@ -14,14 +14,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 1) Build da imagem + push no ECR
   build-push:
     runs-on: ubuntu-latest
     env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      ECR_REPO:   ${{ secrets.ECR_REPO }}   # ex.: 6900....dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app
+      AWS_REGION: ${{ secrets.AWS_REGION }}   # ex.: us-east-2
+      ECR_REPO:   ${{ secrets.ECR_REPO }}     # ex.: 6900...dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # (opcional, mas recomendado) Validar app antes do build
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install deps
+        working-directory: app
+        run: npm ci || npm install
+
+      - name: Lint
+        working-directory: app
+        run: npm run lint
+
+      - name: Tests
+        working-directory: app
+        run: npm test -- --coverage
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -32,9 +53,13 @@ jobs:
 
       - name: Sanity check ECR_REPO
         run: |
-          if ! echo "$ECR_REPO" | grep -q "dkr.ecr"; then
-            echo "ECR_REPO parece inválido: <$ECR_REPO>"; exit 1;
+          if [ -z "$ECR_REPO" ]; then
+            echo "ERRO: secret ECR_REPO está vazio."; exit 1
           fi
+          if ! echo "$ECR_REPO" | grep -qE '\.dkr\.ecr\..+\.amazonaws\.com/.+'; then
+            echo "ERRO: ECR_REPO inválido: <$ECR_REPO>"; exit 1
+          fi
+          echo "ECR repo ok: $(echo "$ECR_REPO" | awk -F/ '{print $1"/"$2}')"
 
       - name: Ensure ECR repository exists
         run: |
@@ -46,14 +71,24 @@ jobs:
       - name: Login to ECR
         run: |
           REGISTRY="$(echo $ECR_REPO | awk -F/ '{print $1}')"
-          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
 
       - name: Build image
         working-directory: app
+        env:
+          ECR_REPO: ${{ secrets.ECR_REPO }}
+          GIT_SHA:  ${{ github.sha }}
         run: |
           set -e
-          echo "IMAGE_SHA=${ECR_REPO}:${GITHUB_SHA}" >> $GITHUB_ENV
-          echo "IMAGE_LATEST=${ECR_REPO}:latest"     >> $GITHUB_ENV
+          IMAGE_SHA="${ECR_REPO}:${GIT_SHA}"
+          IMAGE_LATEST="${ECR_REPO}:latest"
+          echo "Usando tags:"
+          echo "  - $IMAGE_SHA"
+          echo "  - $IMAGE_LATEST"
+          # disponibiliza para passos seguintes
+          echo "IMAGE_SHA=$IMAGE_SHA"       >> "$GITHUB_ENV"
+          echo "IMAGE_LATEST=$IMAGE_LATEST" >> "$GITHUB_ENV"
           docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
 
       - name: Push image
@@ -62,6 +97,7 @@ jobs:
           docker push "$IMAGE_SHA"
           docker push "$IMAGE_LATEST"
 
+  # 2) Deploy efêmero (sobe 1 task, valida /health e encerra)
   deploy-ephemeral:
     needs: build-push
     runs-on: ubuntu-latest
@@ -73,7 +109,6 @@ jobs:
       EXEC_ROLE:  ecsTaskExecutionRole-devops-fase1
       LOG_GROUP:  /ecs/devops-fase1-ephemeral
       PORT:       "3000"
-
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -84,8 +119,11 @@ jobs:
 
       - name: Sanity check ECR_REPO
         run: |
-          if ! echo "$ECR_REPO" | grep -q "dkr.ecr"; then
-            echo "ECR_REPO parece inválido: <$ECR_REPO>"; exit 1;
+          if [ -z "$ECR_REPO" ]; then
+            echo "ERRO: secret ECR_REPO está vazio."; exit 1
+          fi
+          if ! echo "$ECR_REPO" | grep -qE '\.dkr\.ecr\..+\.amazonaws\.com/.+'; then
+            echo "ERRO: ECR_REPO inválido: <$ECR_REPO>"; exit 1
           fi
 
       - name: Discover account/VPC/subnets
@@ -111,8 +149,11 @@ jobs:
         run: |
           set -e
           cat > trust.json <<'JSON'
-          { "Version":"2012-10-17",
-            "Statement":[{ "Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole" }]
+          {
+            "Version":"2012-10-17",
+            "Statement":[
+              {"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}
+            ]
           }
           JSON
           aws iam get-role --role-name "$EXEC_ROLE" >/dev/null 2>&1 || \
