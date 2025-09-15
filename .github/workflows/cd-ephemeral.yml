@@ -1,81 +1,9 @@
-name: CD – Build, Push & Ephemeral Deploy (ECS Fargate)
+name: CD Ephemeral (ECS Fargate)
 
 on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  id-token: write
-
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}           # us-east-2
-  ECR_REPO:   ${{ secrets.ECR_REPO }}             # ex.: 6900....dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app
-  PORT:       "3000"
-
-jobs:
-  build-push:
-    runs-on: ubuntu-latest
-    outputs:
-      image_sha: ${{ steps.meta.outputs.image_sha }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node (para rodar lint/test antes de buildar)
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: 'npm'
-          cache-dependency-path: app/package-lock.json
-
-      - name: Install deps
-        working-directory: app
-        run: npm ci || npm install
-
-      - name: Lint
-        working-directory: app
-        run: npm run lint
-
-      - name: Tests
-        working-directory: app
-        run: npm test -- --coverage
-
-      - name: Configure AWS credentials (ECR login)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        run: |
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$(echo $ECR_REPO | awk -F/ '{print $1}')"
-
-      - name: Compute tags
-        id: meta
-        run: |
-          echo "image_sha=$ECR_REPO:${GITHUB_SHA}" >> $GITHUB_OUTPUT
-          echo "IMAGE_SHA=$ECR_REPO:${GITHUB_SHA}"  >> $GITHUB_ENV
-          echo "IMAGE_LATEST=$ECR_REPO:latest"      >> $GITHUB_ENV
-
-      - name: Build image
-        working-directory: app
-        run: |
-          docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
-
-      - name: Push image
-        run: |
-          docker push "$IMAGE_SHA"
-          docker push "$IMAGE_LATEST"
-
-name: CD – Build, Push & Ephemeral Deploy
-
-on:
-  workflow_dispatch:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -90,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
-      ECR_REPO:   ${{ secrets.ECR_REPO }}
+      ECR_REPO:   ${{ secrets.ECR_REPO }}   # ex.: 6900....dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -124,10 +52,8 @@ jobs:
         working-directory: app
         run: |
           set -e
-          IMAGE_SHA="${ECR_REPO}:${GITHUB_SHA}"
-          IMAGE_LATEST="${ECR_REPO}:latest"
-          echo "IMAGE_SHA=$IMAGE_SHA"       >> $GITHUB_ENV
-          echo "IMAGE_LATEST=$IMAGE_LATEST" >> $GITHUB_ENV
+          echo "IMAGE_SHA=${ECR_REPO}:${GITHUB_SHA}" >> $GITHUB_ENV
+          echo "IMAGE_LATEST=${ECR_REPO}:latest"     >> $GITHUB_ENV
           docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
 
       - name: Push image
