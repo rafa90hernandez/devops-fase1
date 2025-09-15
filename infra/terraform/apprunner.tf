@@ -3,9 +3,9 @@ resource "aws_iam_role" "apprunner_ecr_access" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect    = "Allow",
+      Effect   = "Allow",
       Principal = { Service = "build.apprunner.amazonaws.com" },
-      Action    = "sts:AssumeRole"
+      Action   = "sts:AssumeRole"
     }]
   })
 }
@@ -17,7 +17,11 @@ resource "aws_iam_role_policy" "apprunner_ecr_policy" {
     Version = "2012-10-17",
     Statement = [{
       Effect   = "Allow",
-      Action   = ["ecr:GetAuthorizationToken", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"],
+      Action   = [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
       Resource = "*"
     }]
   })
@@ -27,13 +31,17 @@ resource "aws_apprunner_service" "api" {
   service_name = "devops-fase1-api"
 
   source_configuration {
-    authentication_configuration { access_role_arn = aws_iam_role.apprunner_ecr_access.arn }
+    authentication_configuration {
+      access_role_arn = aws_iam_role.apprunner_ecr_access.arn
+    }
     image_repository {
       image_identifier      = "${aws_ecr_repository.app.repository_url}:latest"
       image_repository_type = "ECR"
       image_configuration {
-        port                          = "3000"
-        runtime_environment_variables = { NODE_ENV = "production" }
+        port = "3000"
+        runtime_environment_variables = {
+          NODE_ENV = "production"
+        }
       }
     }
     auto_deployments_enabled = true
@@ -56,3 +64,4 @@ resource "aws_apprunner_service" "api" {
 
 output "apprunner_service_url" { value = aws_apprunner_service.api.service_url }
 output "apprunner_service_arn" { value = aws_apprunner_service.api.arn }
+
