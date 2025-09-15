@@ -51,8 +51,8 @@ resource "aws_apprunner_service" "api" {
   }
 
   health_check_configuration {
-    protocol = "HTTP"
-    path     = "/health"
+    protocol            = "HTTP"
+    path                = "/health"
     healthy_threshold   = 1
     unhealthy_threshold = 3
     interval            = 10
@@ -65,4 +65,10 @@ resource "aws_apprunner_service" "api" {
   }
 }
 
-output "apprunner_service_
+output "apprunner_service_url" {
+  value = var.enable_apprunner ? aws_apprunner_service.api[0].service_url : ""
+}
+
+output "apprunner_service_arn" {
+  value = var.enable_apprunner ? aws_apprunner_service.api[0].arn : ""
+}
