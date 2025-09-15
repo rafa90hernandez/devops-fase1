@@ -3,9 +3,9 @@ resource "aws_iam_role" "apprunner_ecr_access" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect   = "Allow",
+      Effect    = "Allow",
       Principal = { Service = "build.apprunner.amazonaws.com" },
-      Action   = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -16,8 +16,8 @@ resource "aws_iam_role_policy" "apprunner_ecr_policy" {
   policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect   = "Allow",
-      Action   = [
+      Effect = "Allow",
+      Action = [
         "ecr:GetAuthorizationToken",
         "ecr:BatchGetImage",
         "ecr:GetDownloadUrlForLayer"
