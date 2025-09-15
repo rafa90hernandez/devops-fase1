@@ -1,0 +1,42 @@
+name: One-time Build & Push
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  packages: read
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPO:   ${{ secrets.ECR_REPO }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin $(echo $ECR_REPO | awk -F/ '{print $1}')
+
+      - name: Build image
+        working-directory: app
+        run: |
+          echo "IMAGE_SHA=$ECR_REPO:${{ github.sha }}" >> $GITHUB_ENV
+          echo "IMAGE_LATEST=$ECR_REPO:latest" >> $GITHUB_ENV
+          docker build -t $IMAGE_SHA -t $IMAGE_LATEST .
+
+      - name: Push image
+        run: |
+          docker push $IMAGE_SHA
+          docker push $IMAGE_LATEST
