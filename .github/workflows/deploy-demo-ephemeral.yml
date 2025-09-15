@@ -1,0 +1,71 @@
+name: Deploy Demo (Ephemeral App Runner)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: AWS whoami
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: aws sts get-caller-identity
+
+      - name: Terraform init/validate
+        run: |
+          terraform init -input=false
+          terraform validate
+
+      - name: Import S3/ECR se já existirem (idempotente)
+        run: |
+          set +e
+          terraform import aws_s3_bucket.artifacts devops-fase1-rafael-2025-artifacts
+          terraform import aws_ecr_repository.app devops-fase1-app
+          exit 0
+
+      - name: APPLY (CRIAR App Runner somente para demo)
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          terraform apply -auto-approve -no-color -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="bucket_name=devops-fase1-rafael-2025-artifacts" \
+            -var="create_ec2=false" \
+            -var="enable_apprunner=true"
+
+      - name: Pegar URL e testar /health
+        run: |
+          URL=$(terraform output -raw apprunner_service_url)
+          echo "URL=$URL"
+          for i in {1..30}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || true)
+            echo "try $i -> $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 5
+          done
+          echo "Smoke test falhou"; exit 1
+
+      - name: DESTROY (remover App Runner para zerar custo)
+        if: always()
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          terraform apply -auto-approve -no-color -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="bucket_name=devops-fase1-rafael-2025-artifacts" \
+            -var="create_ec2=false" \
+            -var="enable_apprunner=false"
