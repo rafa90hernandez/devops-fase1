@@ -24,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # (opcional, mas recomendado) Validar app antes do build
+      # (opcional) Validar app antes do build
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -51,42 +51,65 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Sanity check ECR_REPO
+      - name: Sanitize & validate ECR_REPO
+        id: ecrvars
+        shell: bash
         run: |
-          if [ -z "$ECR_REPO" ]; then
+          set -e
+          if [ -z "${ECR_REPO:-}" ]; then
             echo "ERRO: secret ECR_REPO está vazio."; exit 1
           fi
-          if ! echo "$ECR_REPO" | grep -qE '\.dkr\.ecr\..+\.amazonaws\.com/.+'; then
-            echo "ERRO: ECR_REPO inválido: <$ECR_REPO>"; exit 1
+
+          # Remove https:// se veio com protocolo, remove espaços e CR/LF do fim
+          RAW="$(printf '%s' "$ECR_REPO" | sed -E 's#^https?://##' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+
+          # REGISTRY = parte antes da primeira '/'
+          REGISTRY="$(printf '%s' "$RAW" | cut -d/ -f1)"
+          # REPO_PATH = tudo após a primeira '/' (suporta namespaces tipo a/b/c)
+          REPO_PATH="$(printf '%s' "$RAW" | cut -d/ -f2-)"
+          if [ -z "$REPO_PATH" ] || [ "$REPO_PATH" = "$RAW" ]; then
+            echo "ERRO: ECR_REPO precisa ter REGISTRY/REPO, ex.: 123456789012.dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app"; exit 1
           fi
-          echo "ECR repo ok: $(echo "$ECR_REPO" | awk -F/ '{print $1"/"$2}')"
+
+          # Valida contra regex do ECR (apenas minúsculas, números, . _ - e / entre segmentos)
+          if ! echo "$REPO_PATH" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*(\/[a-z0-9]+([._-][a-z0-9]+)*)*$'; then
+            echo "ERRO: Nome de repositório inválido: <$REPO_PATH>."
+            echo "Use apenas minúsculas, números, '.', '_', '-' e '/' para namespaces."; exit 1
+          fi
+
+          IMAGE_REPO="${REGISTRY}/${REPO_PATH}"
+
+          echo "REGISTRY=$REGISTRY"       >> $GITHUB_ENV
+          echo "REPO_PATH=$REPO_PATH"     >> $GITHUB_ENV
+          echo "IMAGE_REPO=$IMAGE_REPO"   >> $GITHUB_ENV
+
+          echo "Registro   : $REGISTRY"
+          echo "Repositório: $REPO_PATH"
+          echo "Imagem base: $IMAGE_REPO"
 
       - name: Ensure ECR repository exists
         run: |
           set -e
-          REPO_NAME="${ECR_REPO##*/}"
-          aws ecr describe-repositories --repository-names "$REPO_NAME" >/dev/null 2>&1 \
-            || aws ecr create-repository --repository-name "$REPO_NAME" >/dev/null
+          aws ecr describe-repositories --repository-names "$REPO_PATH" >/dev/null 2>&1 \
+            || aws ecr create-repository --repository-name "$REPO_PATH" >/dev/null
 
       - name: Login to ECR
         run: |
-          REGISTRY="$(echo $ECR_REPO | awk -F/ '{print $1}')"
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login --username AWS --password-stdin "$REGISTRY"
 
       - name: Build image
         working-directory: app
         env:
-          ECR_REPO: ${{ secrets.ECR_REPO }}
-          GIT_SHA:  ${{ github.sha }}
+          IMAGE_REPO: ${{ env.IMAGE_REPO }}
+          GIT_SHA:    ${{ github.sha }}
         run: |
           set -e
-          IMAGE_SHA="${ECR_REPO}:${GIT_SHA}"
-          IMAGE_LATEST="${ECR_REPO}:latest"
+          IMAGE_SHA="${IMAGE_REPO}:${GIT_SHA}"
+          IMAGE_LATEST="${IMAGE_REPO}:latest"
           echo "Usando tags:"
           echo "  - $IMAGE_SHA"
           echo "  - $IMAGE_LATEST"
-          # disponibiliza para passos seguintes
           echo "IMAGE_SHA=$IMAGE_SHA"       >> "$GITHUB_ENV"
           echo "IMAGE_LATEST=$IMAGE_LATEST" >> "$GITHUB_ENV"
           docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
@@ -117,14 +140,25 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Sanity check ECR_REPO
+      - name: Sanitize & validate ECR_REPO (again)
+        id: ecrvars2
+        shell: bash
         run: |
-          if [ -z "$ECR_REPO" ]; then
-            echo "ERRO: secret ECR_REPO está vazio."; exit 1
+          set -e
+          RAW="$(printf '%s' "$ECR_REPO" | sed -E 's#^https?://##' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+          REGISTRY="$(printf '%s' "$RAW" | cut -d/ -f1)"
+          REPO_PATH="$(printf '%s' "$RAW" | cut -d/ -f2-)"
+          if [ -z "$REPO_PATH" ] || [ "$REPO_PATH" = "$RAW" ]; then
+            echo "ERRO: ECR_REPO precisa ter REGISTRY/REPO"; exit 1
           fi
-          if ! echo "$ECR_REPO" | grep -qE '\.dkr\.ecr\..+\.amazonaws\.com/.+'; then
-            echo "ERRO: ECR_REPO inválido: <$ECR_REPO>"; exit 1
+          if ! echo "$REPO_PATH" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*(\/[a-z0-9]+([._-][a-z0-9]+)*)*$'; then
+            echo "ERRO: Repositório inválido: <$REPO_PATH>"; exit 1
           fi
+          IMAGE_REPO="${REGISTRY}/${REPO_PATH}"
+          echo "REGISTRY=$REGISTRY"       >> $GITHUB_ENV
+          echo "REPO_PATH=$REPO_PATH"     >> $GITHUB_ENV
+          echo "IMAGE_REPO=$IMAGE_REPO"   >> $GITHUB_ENV
+          echo "Repo validado: $IMAGE_REPO"
 
       - name: Discover account/VPC/subnets
         id: disco
@@ -188,11 +222,11 @@ jobs:
         id: img
         run: |
           set -e
-          REPO_NAME="${ECR_REPO##*/}"
+          REPO_NAME="$REPO_PATH"
           if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="${GITHUB_SHA}" >/dev/null 2>&1; then
-            URI="$ECR_REPO:${GITHUB_SHA}"
+            URI="${IMAGE_REPO}:${GITHUB_SHA}"
           else
-            URI="$ECR_REPO:latest"
+            URI="${IMAGE_REPO}:latest"
           fi
           echo "uri=$URI" >> $GITHUB_OUTPUT
           echo "Usando imagem: $URI"
