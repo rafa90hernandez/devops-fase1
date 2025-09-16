@@ -1,0 +1,381 @@
+name: CI/CD – Node, Terraform, ECR & Deploy Efêmero (ECS Fargate)
+
+on:
+  push:
+    branches: [ main ]     # CD só roda em commits na main
+  pull_request:             # PRs rodam apenas CI (sem build/push/deploy)
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ci-cd-ephemeral
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}   # ex.: us-east-2
+  ECR_REPO:   ${{ secrets.ECR_REPO }}     # ex.: 6900...dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app
+  PORT:       "3000"
+
+jobs:
+  # =========================
+  # 1) CI: Lint + Test + Terraform (plan)
+  # =========================
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- Node (app/) ---
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install deps
+        working-directory: app
+        run: npm ci || npm install
+
+      - name: Lint
+        working-directory: app
+        run: npm run lint
+
+      - name: Tests
+        working-directory: app
+        run: npm test -- --coverage
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: app/coverage
+
+      # --- Terraform (infra/terraform) ---
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform fmt/validate
+        working-directory: infra/terraform
+        run: |
+          terraform fmt -recursive
+          terraform init -input=false
+          terraform validate
+
+      - name: Configure AWS credentials for plan
+        if: ${{ github.event_name != 'pull_request' }}   # não tentar plan em PR de forks
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Terraform plan (não-aplicativo)
+        if: ${{ github.event_name != 'pull_request' }}   # evita secrets em PR de forks
+        working-directory: infra/terraform
+        run: |
+          terraform plan -no-color -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="bucket_name=devops-fase1-rafael-2025-artifacts" \
+            -var="create_ec2=false" \
+            -var="enable_apprunner=false"
+
+  # =========================
+  # 2) Build & Push (só em main)
+  # =========================
+  build-push:
+    needs: ci
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPO:   ${{ secrets.ECR_REPO }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Sanitize & validate ECR_REPO
+        id: ecrvars
+        shell: bash
+        run: |
+          set -e
+          if [ -z "${ECR_REPO:-}" ]; then
+            echo "ERRO: secret ECR_REPO está vazio."; exit 1
+          fi
+          RAW="$(printf '%s' "$ECR_REPO" | sed -E 's#^https?://##' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+          REGISTRY="$(printf '%s' "$RAW" | cut -d/ -f1)"
+          REPO_PATH="$(printf '%s' "$RAW" | cut -d/ -f2-)"
+          if [ -z "$REPO_PATH" ] || [ "$REPO_PATH" = "$RAW" ]; then
+            echo "ERRO: ECR_REPO precisa ser REGISTRY/REPO"; exit 1
+          fi
+          if ! echo "$REPO_PATH" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*(\/[a-z0-9]+([._-][a-z0-9]+)*)*$'; then
+            echo "ERRO: Nome de repositório inválido: <$REPO_PATH>"; exit 1
+          fi
+          IMAGE_REPO="${REGISTRY}/${REPO_PATH}"
+          echo "REGISTRY=$REGISTRY"     >> $GITHUB_ENV
+          echo "REPO_PATH=$REPO_PATH"   >> $GITHUB_ENV
+          echo "IMAGE_REPO=$IMAGE_REPO" >> $GITHUB_ENV
+          echo "Repo validado: $IMAGE_REPO"
+
+      - name: Ensure ECR repository exists
+        run: |
+          set -e
+          aws ecr describe-repositories --repository-names "$REPO_PATH" >/dev/null 2>&1 \
+            || aws ecr create-repository --repository-name "$REPO_PATH" >/dev/null
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+
+      - name: Build image
+        working-directory: app
+        env:
+          IMAGE_REPO: ${{ env.IMAGE_REPO }}
+          GIT_SHA:    ${{ github.sha }}
+        run: |
+          set -e
+          IMAGE_SHA="${IMAGE_REPO}:${GIT_SHA}"
+          IMAGE_LATEST="${IMAGE_REPO}:latest"
+          echo "IMAGE_SHA=$IMAGE_SHA"       >> "$GITHUB_ENV"
+          echo "IMAGE_LATEST=$IMAGE_LATEST" >> "$GITHUB_ENV"
+          docker build -t "$IMAGE_SHA" -t "$IMAGE_LATEST" .
+
+      - name: Push image
+        run: |
+          set -e
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+
+  # =========================
+  # 3) Deploy Efêmero (ECS Fargate)
+  # =========================
+  deploy-ephemeral:
+    needs: build-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPO:   ${{ secrets.ECR_REPO }}
+      CLUSTER:    devops-fase1-ephemeral
+      FAMILY:     devops-fase1-task
+      EXEC_ROLE:  ecsTaskExecutionRole-devops-fase1
+      LOG_GROUP:  /ecs/devops-fase1-ephemeral
+      PORT:       "3000"
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Sanitize & validate ECR_REPO
+        id: ecrvars2
+        shell: bash
+        run: |
+          set -e
+          RAW="$(printf '%s' "$ECR_REPO" | sed -E 's#^https?://##' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+          REGISTRY="$(printf '%s' "$RAW" | cut -d/ -f1)"
+          REPO_PATH="$(printf '%s' "$RAW" | cut -d/ -f2-)"
+          if [ -z "$REPO_PATH" ] || [ "$REPO_PATH" = "$RAW" ]; then
+            echo "ERRO: ECR_REPO precisa ser REGISTRY/REPO"; exit 1
+          fi
+          if ! echo "$REPO_PATH" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*(\/[a-z0-9]+([._-][a-z0-9]+)*)*$'; then
+            echo "ERRO: Repositório inválido: <$REPO_PATH>"; exit 1
+          fi
+          IMAGE_REPO="${REGISTRY}/${REPO_PATH}"
+          echo "REGISTRY=$REGISTRY"     >> $GITHUB_ENV
+          echo "REPO_PATH=$REPO_PATH"   >> $GITHUB_ENV
+          echo "IMAGE_REPO=$IMAGE_REPO" >> $GITHUB_ENV
+
+      - name: Discover account/VPC/subnets
+        id: disco
+        shell: bash
+        run: |
+          set -e
+          export AWS_PAGER=""
+          ACC=$(aws sts get-caller-identity --query Account --output text)
+          VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+          SUBS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC --query 'Subnets[].SubnetId' --output text)
+          echo "ACCOUNT_ID=$ACC"   >> $GITHUB_ENV
+          echo "vpc=$VPC"          >> $GITHUB_OUTPUT
+          echo "subnets=$SUBS"     >> $GITHUB_OUTPUT
+
+      - name: Ensure ECS service-linked role exists
+        run: |
+          set -e
+          aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com || true
+          aws iam get-role --role-name AWSServiceRoleForECS >/dev/null
+
+      - name: Ensure ECS cluster ACTIVE (create or recreate)
+        run: |
+          set -e
+          STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null || echo "NONE")
+          echo "Cluster status atual: $STATUS"
+          if [ "$STATUS" = "ACTIVE" ]; then
+            echo "Cluster já está ACTIVE."
+          else
+            echo "Recriando cluster '$CLUSTER'..."
+            aws ecs delete-cluster --cluster "$CLUSTER" >/dev/null 2>&1 || true
+            aws ecs create-cluster --cluster-name "$CLUSTER" >/dev/null
+            for i in {1..10}; do
+              NEW=$(aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null || echo "NONE")
+              echo "wait $i -> $NEW"
+              [ "$NEW" = "ACTIVE" ] && break
+              sleep 3
+            done
+            FINAL=$(aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null || echo "NONE")
+            if [ "$FINAL" != "ACTIVE" ]; then
+              echo "Falha ao ativar o cluster ($FINAL)"; exit 1
+            fi
+          fi
+
+      - name: Ensure SG (abre porta)
+        id: net
+        run: |
+          set -e
+          VPC="${{ steps.disco.outputs.vpc }}"
+          SG_NAME=devops-fase1-ephemeral-sg
+          SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "ephemeral ecs" --vpc-id "$VPC" --query 'GroupId' --output text 2>/dev/null || true)
+          if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+            SG_ID=$(aws ec2 describe-security-groups --filters Name=group-name,Values="$SG_NAME" Name=vpc-id,Values="$VPC" --query 'SecurityGroups[0].GroupId' --output text)
+          fi
+          aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port $PORT --cidr 0.0.0.0/0 2>/dev/null || true
+          echo "sg=$SG_ID" >> $GITHUB_OUTPUT
+
+      - name: Set log retention (1 day)
+        run: |
+          aws logs create-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
+          aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 1 || true
+
+      - name: Resolve image URI (prefer :SHA, fallback :latest)
+        id: img
+        run: |
+          set -e
+          REPO_NAME="$REPO_PATH"
+          if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="${GITHUB_SHA}" >/dev/null 2>&1; then
+            URI="${IMAGE_REPO}:${GITHUB_SHA}"
+          else
+            URI="${IMAGE_REPO}:latest"
+          fi
+          echo "uri=$URI" >> $GITHUB_OUTPUT
+          echo "Usando imagem: $URI"
+
+      - name: Ensure execution role for ECS tasks
+        run: |
+          set -e
+          cat > trust.json <<'JSON'
+          { "Version":"2012-10-17",
+            "Statement":[{ "Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole" }]
+          }
+          JSON
+          aws iam get-role --role-name "$EXEC_ROLE" >/dev/null 2>&1 || \
+            aws iam create-role --role-name "$EXEC_ROLE" --assume-role-policy-document file://trust.json
+          aws iam attach-role-policy --role-name "$EXEC_ROLE" \
+            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+          aws iam attach-role-policy --role-name "$EXEC_ROLE" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly || true
+
+      - name: Register task definition
+        id: td
+        run: |
+          set -e
+          IMG="${{ steps.img.outputs.uri }}"
+          echo "Registrando task com imagem: $IMG"
+          cat > td.json <<JSON
+          {
+            "family": "${FAMILY}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/${EXEC_ROLE}",
+            "containerDefinitions": [{
+              "name": "app",
+              "image": "${IMG}",
+              "portMappings": [{ "containerPort": ${PORT}, "protocol": "tcp" }],
+              "essential": true,
+              "environment": [{ "name":"NODE_ENV","value":"production" }],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "${LOG_GROUP}",
+                  "awslogs-region": "${AWS_REGION}",
+                  "awslogs-stream-prefix": "app"
+                }
+              }
+            }]
+          }
+          JSON
+          REV=$(aws ecs register-task-definition --cli-input-json file://td.json --query 'taskDefinition.revision' --output text)
+          echo "rev=$REV" >> $GITHUB_OUTPUT
+
+      - name: Run task (public IP) and wait
+        id: run
+        run: |
+          set -e
+          SUBS="${{ steps.disco.outputs.subnets }}"
+          SUBS_JSON=$(echo $SUBS | sed 's/ \+/,/g')
+          SG="${{ steps.net.outputs.sg }}"
+          TD_REV="${{ steps.td.outputs.rev }}"
+          TASK_ARN=$(aws ecs run-task --cluster "$CLUSTER" --launch-type FARGATE --count 1 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBS_JSON],securityGroups=[$SG],assignPublicIp=ENABLED}" \
+            --task-definition "${FAMILY}:${TD_REV}" --query 'tasks[0].taskArn' --output text)
+          echo "task=$TASK_ARN" >> $GITHUB_OUTPUT
+
+          for i in {1..30}; do
+            ENI=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
+              --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text)
+            if [ -n "$ENI" ] && [ "$ENI" != "None" ]; then
+              PUBIP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" \
+                --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+              if [ -n "$PUBIP" ] && [ "$PUBIP" != "None" ]; then
+                echo "ip=$PUBIP" >> $GITHUB_OUTPUT
+                echo "Public IP: $PUBIP"
+                break
+              fi
+            fi
+            sleep 5
+          done
+
+      - name: Smoke test /health
+        run: |
+          set -e
+          IP="${{ steps.run.outputs.ip }}"
+          for i in {1..30}; do
+            code=$(curl -m 3 -s -o /dev/null -w "%{http_code}" "http://$IP:${PORT}/health" || true)
+            echo "try $i -> $code"
+            test "$code" = "200" && exit 0
+            sleep 5
+          done
+          echo "Smoke test falhou"; exit 1
+
+      - name: Stop task and clean SG
+        if: always()
+        run: |
+          set +e
+          TASK="${{ steps.run.outputs.task }}"
+          SG="${{ steps.net.outputs.sg }}"
+          aws ecs stop-task --cluster "$CLUSTER" --task "$TASK" >/dev/null 2>&1 || true
+          sleep 20
+          aws ec2 delete-security-group --group-id "$SG" >/dev/null 2>&1 || true
+
+      - name: Deregister task definition (optional)
+        if: always()
+        run: |
+          set +e
+          REV="${{ steps.td.outputs.rev }}"
+          aws ecs deregister-task-definition --task-definition "${FAMILY}:${REV}" >/dev/null 2>&1 || true
