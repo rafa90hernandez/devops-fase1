@@ -59,33 +59,20 @@ jobs:
           if [ -z "${ECR_REPO:-}" ]; then
             echo "ERRO: secret ECR_REPO está vazio."; exit 1
           fi
-
-          # Remove https:// se veio com protocolo, remove espaços e CR/LF do fim
           RAW="$(printf '%s' "$ECR_REPO" | sed -E 's#^https?://##' | tr -d '\r' | sed 's/[[:space:]]*$//')"
-
-          # REGISTRY = parte antes da primeira '/'
           REGISTRY="$(printf '%s' "$RAW" | cut -d/ -f1)"
-          # REPO_PATH = tudo após a primeira '/' (suporta namespaces tipo a/b/c)
           REPO_PATH="$(printf '%s' "$RAW" | cut -d/ -f2-)"
           if [ -z "$REPO_PATH" ] || [ "$REPO_PATH" = "$RAW" ]; then
-            echo "ERRO: ECR_REPO precisa ter REGISTRY/REPO, ex.: 123456789012.dkr.ecr.us-east-2.amazonaws.com/devops-fase1-app"; exit 1
+            echo "ERRO: ECR_REPO precisa ter REGISTRY/REPO"; exit 1
           fi
-
-          # Valida contra regex do ECR (apenas minúsculas, números, . _ - e / entre segmentos)
           if ! echo "$REPO_PATH" | grep -Eq '^[a-z0-9]+([._-][a-z0-9]+)*(\/[a-z0-9]+([._-][a-z0-9]+)*)*$'; then
-            echo "ERRO: Nome de repositório inválido: <$REPO_PATH>."
-            echo "Use apenas minúsculas, números, '.', '_', '-' e '/' para namespaces."; exit 1
+            echo "ERRO: Nome de repositório inválido: <$REPO_PATH>"; exit 1
           fi
-
           IMAGE_REPO="${REGISTRY}/${REPO_PATH}"
-
-          echo "REGISTRY=$REGISTRY"       >> $GITHUB_ENV
-          echo "REPO_PATH=$REPO_PATH"     >> $GITHUB_ENV
-          echo "IMAGE_REPO=$IMAGE_REPO"   >> $GITHUB_ENV
-
-          echo "Registro   : $REGISTRY"
-          echo "Repositório: $REPO_PATH"
-          echo "Imagem base: $IMAGE_REPO"
+          echo "REGISTRY=$REGISTRY"     >> $GITHUB_ENV
+          echo "REPO_PATH=$REPO_PATH"   >> $GITHUB_ENV
+          echo "IMAGE_REPO=$IMAGE_REPO" >> $GITHUB_ENV
+          echo "Repo validado: $IMAGE_REPO"
 
       - name: Ensure ECR repository exists
         run: |
@@ -155,9 +142,9 @@ jobs:
             echo "ERRO: Repositório inválido: <$REPO_PATH>"; exit 1
           fi
           IMAGE_REPO="${REGISTRY}/${REPO_PATH}"
-          echo "REGISTRY=$REGISTRY"       >> $GITHUB_ENV
-          echo "REPO_PATH=$REPO_PATH"     >> $GITHUB_ENV
-          echo "IMAGE_REPO=$IMAGE_REPO"   >> $GITHUB_ENV
+          echo "REGISTRY=$REGISTRY"     >> $GITHUB_ENV
+          echo "REPO_PATH=$REPO_PATH"   >> $GITHUB_ENV
+          echo "IMAGE_REPO=$IMAGE_REPO" >> $GITHUB_ENV
           echo "Repo validado: $IMAGE_REPO"
 
       - name: Discover account/VPC/subnets
@@ -179,31 +166,34 @@ jobs:
           aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com || true
           aws iam get-role --role-name AWSServiceRoleForECS >/dev/null
 
-      - name: Ensure execution role for ECS tasks
+      # === FIX: garantir que o cluster esteja ACTIVE (recria se INACTIVE/ausente) ===
+      - name: Ensure ECS cluster ACTIVE (create or recreate)
         run: |
           set -e
-          cat > trust.json <<'JSON'
-          {
-            "Version":"2012-10-17",
-            "Statement":[
-              {"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}
-            ]
-          }
-          JSON
-          aws iam get-role --role-name "$EXEC_ROLE" >/dev/null 2>&1 || \
-            aws iam create-role --role-name "$EXEC_ROLE" --assume-role-policy-document file://trust.json
-          aws iam attach-role-policy --role-name "$EXEC_ROLE" \
-            --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
-          aws iam attach-role-policy --role-name "$EXEC_ROLE" \
-            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly || true
+          STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null || echo "NONE")
+          echo "Cluster status atual: $STATUS"
+          if [ "$STATUS" = "ACTIVE" ]; then
+            echo "Cluster já está ACTIVE."
+          else
+            echo "Recriando cluster '$CLUSTER'..."
+            aws ecs delete-cluster --cluster "$CLUSTER" >/dev/null 2>&1 || true
+            aws ecs create-cluster --cluster-name "$CLUSTER" >/dev/null
+            for i in {1..10}; do
+              NEW=$(aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null || echo "NONE")
+              echo "wait $i -> $NEW"
+              [ "$NEW" = "ACTIVE" ] && break
+              sleep 3
+            done
+            FINAL=$(aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null || echo "NONE")
+            if [ "$FINAL" != "ACTIVE" ]; then
+              echo "Falha ao ativar o cluster ($FINAL)"; exit 1
+            fi
+          fi
 
-      - name: Ensure cluster and SG
+      - name: Ensure SG (abre porta $PORT)
         id: net
         run: |
           set -e
-          aws ecs describe-clusters --clusters "$CLUSTER" --query 'clusters[0].status' --output text 2>/dev/null | grep -q ACTIVE \
-            || aws ecs create-cluster --cluster-name "$CLUSTER" >/dev/null
-
           VPC="${{ steps.disco.outputs.vpc }}"
           SG_NAME=devops-fase1-ephemeral-sg
           SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "ephemeral ecs" --vpc-id "$VPC" --query 'GroupId' --output text 2>/dev/null || true)
